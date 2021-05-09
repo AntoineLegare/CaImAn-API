@@ -7,9 +7,10 @@ import cv2
 import numpy as np
 import os
 from tifffile import imsave
-from scipy.sparse import save_npz
+from scipy.sparse import save_npz, load_npz, hstack
 import gc
 import h5py
+import nrrd
 
 
 class CaImAn:
@@ -48,6 +49,7 @@ class CaImAn:
 
     def stopCluster(self):
         cm.stop_server(dview=self.dview)
+        gc.collect()
 
     def setupParameters(self, rigid):
         if rigid:
@@ -106,11 +108,8 @@ class CaImAn:
 
     def deleteMemoryMappedFiles(self):
         for file in os.listdir(self.path):
-            if len(file.split('.')) > 1:
-                if file.split('.')[1] == 'mmap':
-                    os.remove(self.path + '/' + file)
-        self.stopCluster()
-        gc.collect()
+            if '.mmap' in file:
+                os.remove(self.path + '/' + file)
 
     def saveFilm(self, fileName):
         correctedMovie = cm.load(self.mc.mmap_file)
@@ -134,7 +133,7 @@ class CaImAn:
         if components:
             save_npz(self.path + 'components' + tag + '.npz', self.cnm2.estimates.A)
         if image:
-            imsave(self.path + 'neurons' + tag + '.tif', self.segmented)
+            imsave(self.path + 'segmentation' + tag + '.tif', self.segmented)
 
     @staticmethod
     def convertTo16bit(array):
@@ -165,8 +164,150 @@ class CaimanResults:
         file.close()
 
 
+class Compiler:
+
+    def __init__(self, path, keywords):
+        self.path = path
+        self.keywords = keywords
+        self.results = None
+        self.stack = None
+        self.components = None
+
+    def loadAllPlanes(self):
+        files = os.listdir(self.path)
+        results = {}
+        for file in files:
+            nKeywords = self.countKeywordsInFileName(file, self.keywords)
+            if ('plane' in file) and ('.hdf5' in file):
+                if nKeywords == len(self.keywords):
+                    chunk = file.split('plane')[1]
+                    nDigits = 0
+                    for i in range(len(chunk)):
+                        try:
+                            int(chunk[i])
+                            nDigits += 1
+                        except:
+                            break
+                    plane = chunk[:nDigits]
+                    results[int(plane)] = CaImAn.loadResults(self.path + file)
+        self.results = results
+
+    def loadAllComponents(self):
+        files = os.listdir(self.path)
+        components = {}
+        for file in files:
+            nKeywords = self.countKeywordsInFileName(file, self.keywords)
+            if ('components' in file) and ('.npz' in file):
+                if nKeywords == len(self.keywords):
+                    chunk = file.split('plane')[1]
+                    nDigits = 0
+                    for i in range(len(chunk)):
+                        try:
+                            int(chunk[i])
+                            nDigits += 1
+                        except:
+                            break
+                    plane = chunk[:nDigits]
+                    components[int(plane)] = load_npz(self.path + file)
+        self.components = components
+
+    def compileAndSave(self):
+        results = self.results
+        planes = np.sort(list(results.keys()))
+        plane = planes[0]
+        timeSeries = results[plane].timeSeries
+        planeVector = np.array([plane] * timeSeries.shape[0])
+        deconvolved = results[plane].deconvolved
+        spikes = results[plane].spikes
+        SNR = results[plane].SNR
+        centroids = results[plane].centroids
+        labels = np.expand_dims(results[plane].labels, axis=2)
+        self.stack = np.expand_dims(results[plane].averageFrame, axis=2)
+        for plane in planes[1:]:
+            timeSeries = np.append(timeSeries, results[plane].timeSeries, axis=0)
+            planeVector = np.append(planeVector, [plane] * results[plane].timeSeries.shape[0])
+            deconvolved = np.append(deconvolved, results[plane].deconvolved, axis=0)
+            spikes = np.append(spikes, results[plane].spikes, axis=0)
+            SNR = np.append(SNR, results[plane].SNR, axis=0)
+            centroids = np.append(centroids, results[plane].centroids, axis=0)
+            labels = np.append(labels, np.expand_dims(results[plane].labels, axis=2), axis=2)
+            self.stack = np.append(self.stack, np.expand_dims(results[plane].averageFrame, axis=2), axis=2)
+        fileName = 'results'
+        for keyword in self.keywords:
+            fileName += '_' + keyword
+        fileName += '.hdf5'
+        file = h5py.File(self.path + fileName, 'w')
+        file.create_dataset('labels', data=labels)
+        file.create_dataset('centroids', data=centroids)
+        file.create_dataset('timeSeries', data=timeSeries)
+        file.create_dataset('deconvolved', data=deconvolved)
+        file.create_dataset('spikes', data=spikes)
+        file.create_dataset('SNR', data=SNR)
+        file.create_dataset('planes', data=planeVector)
+        file.create_dataset('averageFrames', data=self.stack)
+        file.close()
+
+    def compileAndSaveComponents(self):
+        planes = np.sort(list(self.components.keys()))
+        C = self.components[planes[0]]
+        for plane in planes[1:]:
+            C = hstack([C, self.components[plane]])
+        fileName = 'components'
+        for keyword in self.keywords:
+            fileName += '_' + keyword
+        fileName += '.npz'
+        save_npz(self.path + fileName, C)
+
+    def saveFilmStack(self):
+        fileName = 'filmStack'
+        for keyword in self.keywords:
+            fileName += '_' + keyword
+        fileName += '.nrrd'
+        nrrd.write(self.path + fileName, np.transpose(self.stack.astype('uint16'), (1, 0, 2)))
+
+    @staticmethod
+    def countKeywordsInFileName(fileName, keywords):
+        nKeywords = 0
+        for keyword in keywords:
+            if keyword in fileName:
+                nKeywords += 1
+        return nKeywords
+
+
 def normalize(vector):
     vector = np.array(vector)
     vector -= min(vector)
     vector /= max(vector)
     return vector
+
+
+if __name__ == '__main__':
+
+    path = '/home/tonepone/Documents/DataPDK/'
+    subjects = ['fish1']
+    experiments = ['df1']
+    planes = [1, 2, 3, 4, 5, 6, 7, 8]
+    tag = '_{}_{}_plane{}'
+
+    for fish in subjects:
+        for experiment in experiments:
+            for plane in planes:
+                caiman = CaImAn(path, '{}_{}.raw #{}.tif'.format(fish, experiment, plane))
+                caiman.correctMotion()
+                caiman.saveFilm('corrected' + tag.format(fish, experiment, plane) + '.tif')
+                os.remove(path + '{}_{}.raw #{}.tif'.format(fish, experiment, plane))
+                caiman.computeSegmentation()
+                caiman.saveResults(tag=tag.format(fish, experiment, plane))
+                caiman.deleteMemoryMappedFiles()
+                caiman.stopCluster()
+
+    compile = False
+    if compile:
+        compiler = Compiler(path, keywords=['fish1', 'df1'])
+        compiler.loadAllPlanes()
+        compiler.compileAndSave()
+        compiler.saveFilmStack()
+        compiler.loadAllComponents()
+        compiler.compileAndSaveComponents()
+
+
